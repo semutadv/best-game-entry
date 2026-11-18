@@ -10,3 +10,18 @@ export function createRandom(seed) {
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 }
+
+/** A number between min (inclusive) and max (exclusive). */
+export function range(random, min, max) {
+  return min + random() * (max - min);
+}
+
+/** One element of an array, picked uniformly. */
+export function pick(random, items) {
+  return items[Math.floor(random() * items.length)];
+}
+
+/** True with the given probability. */
+export function chance(random, probability) {
+  return random() < probability;
+}

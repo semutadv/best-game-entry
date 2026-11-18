@@ -1,79 +1,154 @@
-// The screenshot scenes behind ?shot=start|play|end. Each one plays the real rules forward from a
-// fresh world for a fixed number of steps, steered by a simple autopilot (look ahead each way the
-// paddle could move, keep clear of blocks, chase the lowest coin when that is safe), so the frame
-// is what a short game really looks like and the same seed always gives the same frame.
-import { FIELD, PLAYER, STEP } from './config.js';
-import { EVENT_OVER, KIND_BLOCK } from './world.js';
+// The screenshot scenes behind ?shot=start|play|boss|end. Each one plays the real rules
+// forward from a fresh world for a fixed number of steps, steered by a simple autopilot
+// (dodge the nearest thing falling at the ship, drift toward the nearest raider and keep
+// firing), so the frame is what a short game really looks like and the same seed always
+// gives the same frame. The play and boss scenes keep the densest frame they reach, so
+// the screenshot shows the action at its busiest rather than a gap between waves.
+import { FIELD, STEP } from './config.js';
+import { EVENT_OVER } from './world.js';
 import { SCREEN_OVER, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
 
 const START_SECONDS = 5;
-const PLAY_SECONDS = 26;
+const PLAY_SECONDS = 24;
+const BOSS_SECONDS = 16;
 const END_LIMIT_SECONDS = 600;
-/**
- * How far ahead, in seconds, the autopilot checks each way it could move: the play scene's pilot
- * looks well ahead and keeps all its lives; the end scene's looks only a moment ahead, so it is
- * caught out once the blocks speed up, as a hurried player is.
- */
+/** How far ahead, in seconds, the autopilot looks for a threat. */
 const HORIZON_PLAY = 0.7;
-const HORIZON_END = 0.25;
-const SAMPLE = 1 / 30;
-const DIRECTIONS = [0, -1, 1];
-/** Extra room, each side, it keeps between the paddle and a block. */
-const MARGIN = 10;
+const HORIZON_END = 0.2;
 
-/** Seconds until moving in `direction` (-1, 0, 1) runs the paddle into a block; Infinity when it never does. */
-function timeToHit(state, direction, horizon) {
-  const player = state.player;
-  for (let t = SAMPLE; t <= horizon; t += SAMPLE) {
-    const x = Math.min(FIELD.width - player.width, Math.max(0, player.x + direction * PLAYER.speed * t));
-    for (let index = 0; index < state.items.length; index += 1) {
-      const item = state.items[index];
-      if (!item.active || item.kind !== KIND_BLOCK) continue;
-      const y = item.y + item.speed * t;
-      if (y + item.height > player.y && y < player.y + player.height && item.x < x + player.width + MARGIN && item.x + item.width > x - MARGIN) return t;
-    }
-  }
-  return Infinity;
+function countActive(pool) {
+  let count = 0;
+  for (const entry of pool) if (entry.active) count += 1;
+  return count;
 }
 
-/** Of the safe ways to move, the one toward the lowest coin (or the centre); else the one that is hit last. */
-function autopilot(state, horizon) {
+/** The ship's steering for one step: dodge, chase, and (usually) fire. */
+function autopilot(state, horizon, firing) {
   const player = state.player;
-  let coin = null;
-  for (let index = 0; index < state.items.length; index += 1) {
-    const item = state.items[index];
-    if (item.active && item.kind !== KIND_BLOCK && (coin === null || item.y > coin.y)) coin = item;
+  let steerX = 0;
+
+  // The nearest thing about to reach the ship's height, by time to impact.
+  let threat = null;
+  for (const bullet of state.enemyBullets) {
+    if (!bullet.active || bullet.vy <= 0) continue;
+    const dy = player.y - bullet.y;
+    if (dy < 0 || dy > 340) continue;
+    if (Math.abs(bullet.x - player.x) > 70) continue;
+    const time = dy / bullet.vy;
+    if (time < horizon && (threat === null || time < threat.time)) threat = { x: bullet.x, time };
   }
-  const target = coin === null ? FIELD.width / 2 : coin.x + coin.width / 2;
-  const centre = player.x + player.width / 2;
-  const wanted = target > centre + 8 ? 1 : target < centre - 8 ? -1 : 0;
-  let best = wanted;
-  let bestTime = timeToHit(state, wanted, horizon);
-  for (let index = 0; index < DIRECTIONS.length && bestTime !== Infinity; index += 1) {
-    const time = timeToHit(state, DIRECTIONS[index], horizon);
-    if (time > bestTime) {
-      bestTime = time;
-      best = DIRECTIONS[index];
+  for (const enemy of state.enemies) {
+    if (!enemy.active) continue;
+    const dy = player.y - enemy.y;
+    if (dy < 0 || dy > 260) continue;
+    if (Math.abs(enemy.x - player.x) > enemy.radius + 36) continue;
+    const time = dy / Math.max(1, enemy.vy);
+    if (time < horizon && (threat === null || time < threat.time)) threat = { x: enemy.x, time };
+  }
+  if (threat !== null) {
+    steerX = player.x <= threat.x ? -1 : 1;
+    if (player.x < 70) steerX = 1;
+    if (player.x > FIELD.width - 70) steerX = -1;
+  } else {
+    // Chase the nearest raider (or the boss) so the shots land.
+    let target = state.boss !== null && state.boss.active && !state.boss.entering ? state.boss : null;
+    let nearest = Infinity;
+    for (const enemy of state.enemies) {
+      if (!enemy.active) continue;
+      const distance = Math.abs(enemy.x - player.x) + Math.abs(enemy.y - player.y);
+      if (distance < nearest) {
+        nearest = distance;
+        target = enemy;
+      }
+    }
+    if (target !== null) {
+      const dx = target.x - player.x;
+      steerX = dx > 8 ? 1 : dx < -8 ? -1 : 0;
     }
   }
-  return best;
+  return { steerX, steerY: 0, mouseTarget: null, firing, bomb: false };
+}
+
+/** A plain-data copy of the world's state, for keeping the busiest frame. */
+function snapshotState(state) {
+  return structuredClone(state);
+}
+
+/** Copy a snapshot back into the live state object, keeping its identity. */
+function restoreState(state, snap) {
+  for (const key of Object.keys(snap)) {
+    const value = snap[key];
+    if (value === null) {
+      state[key] = null;
+    } else if (Array.isArray(value)) {
+      for (let i = 0; i < value.length; i += 1) Object.assign(state[key][i], value[i]);
+    } else if (typeof value === 'object') {
+      if (state[key] === null || typeof state[key] !== 'object') state[key] = {};
+      Object.assign(state[key], value);
+    } else {
+      state[key] = value;
+    }
+  }
+}
+
+/** How busy a frame is: raiders and bullets on screen, the ship visible. */
+function frameDensity(state) {
+  let density = countActive(state.enemies) * 2 + countActive(state.bullets) + countActive(state.enemyBullets) + countActive(state.powerups) * 2;
+  if (state.boss !== null && state.boss.active) density += 12;
+  if (state.player.invulnerable > 0) density -= 50;
+  return density;
 }
 
 /**
- * Set `world` to the named scene (start, play or end; any other name is start) and return the
- * screen to draw over it and the best score to show.
+ * Play `seconds` of the game with the autopilot and leave the world at its busiest
+ * frame. Returns whether the pilot survived the whole stretch.
+ */
+function runScene(world, seconds, horizon, firing, setup) {
+  world.reset();
+  if (setup) setup();
+  const state = world.state;
+  const total = Math.floor(seconds / STEP);
+  let best = null;
+  let bestDensity = -1;
+  for (let i = 0; i < total; i += 1) {
+    const events = world.step(STEP, autopilot(state, horizon, firing), false, null);
+    if (events & EVENT_OVER) break;
+    const density = frameDensity(state);
+    if (density > bestDensity) {
+      bestDensity = density;
+      best = snapshotState(state);
+    }
+  }
+  const survived = state.lives > 0;
+  if (best !== null) restoreState(state, best);
+  return survived;
+}
+
+/**
+ * Set `world` to the named scene (start, play, boss or end; any other name is start)
+ * and return the screen to draw over it and the best score to show.
  */
 export function stageShot(name, world) {
   world.reset();
-  if (name !== 'play' && name !== 'end') {
-    for (let index = 0; index < START_SECONDS / STEP; index += 1) world.step(STEP, 0, true);
+  const state = world.state;
+  if (name !== 'play' && name !== 'boss' && name !== 'end') {
+    for (let index = 0; index < START_SECONDS / STEP; index += 1) {
+      world.step(STEP, autopilot(state, HORIZON_PLAY, false), true, null);
+    }
     return { screen: SCREEN_TITLE, best: 0 };
   }
-  const limit = name === 'end' ? END_LIMIT_SECONDS : PLAY_SECONDS;
-  const horizon = name === 'end' ? HORIZON_END : HORIZON_PLAY;
-  for (let index = 0; index < limit / STEP; index += 1) {
-    if (world.step(STEP, autopilot(world.state, horizon), false) & EVENT_OVER) break;
+  if (name === 'boss') {
+    let survived = runScene(world, BOSS_SECONDS, 0.9, true, () => world.beginWave(5));
+    if (!survived) survived = runScene(world, BOSS_SECONDS, 1.3, true, () => world.beginWave(5));
+    return { screen: SCREEN_PLAY, best: state.score };
   }
-  const over = world.state.lives === 0;
-  return { screen: over ? SCREEN_OVER : SCREEN_PLAY, best: world.state.score };
+  if (name === 'end') {
+    for (let index = 0; index < END_LIMIT_SECONDS / STEP; index += 1) {
+      if (world.step(STEP, autopilot(state, HORIZON_END, false), false, null) & EVENT_OVER) break;
+    }
+    return { screen: SCREEN_OVER, best: state.score };
+  }
+  let survived = runScene(world, PLAY_SECONDS, HORIZON_PLAY, true, null);
+  if (!survived) survived = runScene(world, PLAY_SECONDS, 1.2, true, null);
+  return { screen: SCREEN_PLAY, best: state.score };
 }
